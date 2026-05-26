@@ -47,50 +47,6 @@ _CODE_GROUPS: dict[str, dict] = {
         "codes": [99221, 99222, 99223],
         "setting": "inpatient",
     },
-    "emergency_dept": {
-        "codes": [99281, 99282, 99283, 99284, 99285],
-        "setting": "inpatient",
-    },
-    "critical_care": {
-        "codes": [99291],
-        "setting": "inpatient",
-    },
-    "prolonged_services": {
-        "codes": [99345, 99358, 99417],
-        "setting": "both",
-    },
-    "interprofessional_consult": {
-        "codes": [99366, 99367, 99368],
-        "setting": "inpatient",
-    },
-    "preventive_medicine": {
-        "codes": [99384, 99385, 99386, 99387, 99394, 99395, 99396, 99397, 99399],
-        "setting": "both",
-    },
-    "counseling": {
-        "codes": [99406, 99407],
-        "setting": "both",
-    },
-    "unlisted_preventive": {
-        "codes": [99429],
-        "setting": "both",
-    },
-    "care_management": {
-        "codes": [99439, 99441, 99442, 99443],
-        "setting": "both",
-    },
-    "neonatal_newborn": {
-        "codes": [99461, 99463, 99464, 99465],
-        "setting": "inpatient",
-    },
-    "complex_chronic_care": {
-        "codes": [99480, 99483, 99484],
-        "setting": "inpatient",
-    },
-    "transitional_remote_care": {
-        "codes": [99490, 99491, 99492, 99493, 99494, 99495, 99496, 99498],
-        "setting": "both",
-    },
     "infusion": {
         "codes": [96360, 96361, 96365, 96366, 96367, 96368],
         "setting": "both",
@@ -107,6 +63,30 @@ _CODE_GROUPS: dict[str, dict] = {
         "codes": [47000],
         "setting": "inpatient",
     },
+}
+
+CPT_DESCRIPTIONS: dict[str, str] = {
+    "12031": "Wound repair, scalp/trunk 2.5cm or less",
+    "47000": "Liver biopsy, percutaneous needle",
+    "64530": "Celiac plexus nerve block",
+    "96360": "IV infusion, hydration initial 31 min–1 hr",
+    "96361": "IV infusion, hydration each additional hr",
+    "96365": "IV infusion, therapeutic initial up to 1 hr",
+    "96366": "IV infusion, therapeutic each additional hr",
+    "96367": "IV infusion, therapeutic additional sequential",
+    "96368": "IV infusion, therapeutic concurrent",
+    "99202": "Office visit, new patient, low complexity",
+    "99203": "Office visit, new patient, moderate complexity",
+    "99204": "Office visit, new patient, moderate-high complexity",
+    "99205": "Office visit, new patient, high complexity",
+    "99211": "Office visit, established patient, minimal",
+    "99212": "Office visit, established patient, straightforward",
+    "99213": "Office visit, established patient, low complexity",
+    "99214": "Office visit, established patient, moderate complexity",
+    "99215": "Office visit, established patient, high complexity",
+    "99221": "Initial hospital care, low complexity",
+    "99222": "Initial hospital care, moderate complexity",
+    "99223": "Initial hospital care, high complexity",
 }
 
 EPISODE_FREQUENCIES: dict[str, dict] = {

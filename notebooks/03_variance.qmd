@@ -1,0 +1,338 @@
+---
+title: "03 — Charge Variance & Reliability"
+description: |
+  Analyzes cross-hospital charge dispersion per CPT code, identifies
+  high-variance vs. stable codes, detects outliers, and writes a reliability
+  table consumed by 04_episode.
+dependencies:
+  - data/intermediate/medstar_charges.parquet
+  - data/intermediate/episode_codes.parquet
+format: html
+jupyter: python3
+---
+
+## Load Data
+
+```{python}
+import polars as pl
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import numpy as np
+from _common import INTERMEDIATE_DIR, CHARGE_COLS, CPT_DESCRIPTIONS
+
+medstar = pl.read_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+episode_codes = pl.read_parquet(INTERMEDIATE_DIR / "episode_codes.parquet")
+
+medstar_f = medstar.with_columns([
+    pl.col(c).cast(pl.Float64, strict=False) for c in CHARGE_COLS
+])
+print(f"Rows: {medstar_f.shape[0]:,}, Unique codes: {medstar_f['cpt_code'].n_unique()}")
+```
+
+## Cross-Hospital Charge Dispersion
+
+For each CPT code, we compute the coefficient of variation (CV = std/mean),
+IQR, and range across hospitals. Lower CV indicates more consistent pricing.
+
+```{python}
+def compute_cv(series: pl.Series) -> float | None:
+    s = series.drop_nulls()
+    if len(s) < 2:
+        return None
+    mean = s.mean()
+    if mean == 0:
+        return None
+    return s.std() / mean
+
+code_stats = []
+
+for code in medstar_f["cpt_code"].unique().sort().to_list():
+    subset = medstar_f.filter(pl.col("cpt_code") == code)
+    n_hosp = subset["hosp_name"].n_unique()
+
+    gross = subset["charge_gross"].drop_nulls()
+    disc = subset["charge_discounted"].drop_nulls()
+
+    cv_g = compute_cv(subset["charge_gross"])
+    cv_d = compute_cv(subset["charge_discounted"])
+
+    iqr_g = float(gross.quantile(0.75) - gross.quantile(0.25)) if len(gross) >= 4 else None
+    iqr_d = float(disc.quantile(0.75) - disc.quantile(0.25)) if len(disc) >= 4 else None
+
+    code_stats.append({
+        "cpt_code": code,
+        "n_hospitals": n_hosp,
+        "cv_gross": round(cv_g, 3) if cv_g is not None else None,
+        "cv_discounted": round(cv_d, 3) if cv_d is not None else None,
+        "iqr_gross": round(iqr_g, 2) if iqr_g is not None else None,
+        "iqr_discounted": round(iqr_d, 2) if iqr_d is not None else None,
+    })
+
+variance_df = pl.DataFrame(code_stats)
+print(f"Codes analyzed: {variance_df.shape[0]}")
+```
+
+```{python}
+plot_df = variance_df.drop_nulls(subset=["cv_gross", "cv_discounted"])
+if plot_df.shape[0] > 0:
+    descs = [CPT_DESCRIPTIONS.get(c, "") for c in plot_df["cpt_code"].to_list()]
+
+    fig = go.Figure(go.Scatter(
+        x=plot_df["cv_gross"].to_list(),
+        y=plot_df["cv_discounted"].to_list(),
+        mode="markers+text",
+        text=plot_df["cpt_code"].to_list(),
+        textposition="top center",
+        textfont=dict(size=7),
+        marker=dict(
+            size=plot_df["n_hospitals"].to_list(),
+            sizemode="area",
+            sizeref=2 * max(plot_df["n_hospitals"].to_list()) / (40**2),
+            sizemin=5,
+            color=plot_df["cv_gross"].to_list(),
+            colorscale=[[0, "#388e3c"], [0.5, "#ff9800"], [1, "#d32f2f"]],
+            showscale=True,
+            colorbar=dict(title="CV Gross"),
+            opacity=0.8,
+        ),
+        customdata=descs,
+        hovertemplate="<b>CPT %{text}</b><br>%{customdata}<br>CV Gross: %{x:.3f}<br>CV Discounted: %{y:.3f}<extra></extra>",
+    ))
+    fig.add_shape(type="line", x0=0, y0=0, x1=max(plot_df["cv_gross"].max(), plot_df["cv_discounted"].max()),
+                  y1=max(plot_df["cv_gross"].max(), plot_df["cv_discounted"].max()),
+                  line=dict(dash="dash", color="#bdbdbd"), layer="below")
+    fig.update_layout(
+        title="Gross vs. Discounted Charge Variance (bubble size = hospital count)",
+        xaxis_title="CV Gross",
+        yaxis_title="CV Discounted",
+        height=500,
+    )
+    fig.show()
+```
+
+## High-Variance vs. Stable Codes
+
+```{python}
+has_cv = variance_df.filter(pl.col("cv_gross").is_not_null())
+if has_cv.shape[0] > 0:
+    sorted_df = has_cv.sort("cv_gross")
+    codes = sorted_df["cpt_code"].to_list()
+    cvs = sorted_df["cv_gross"].to_list()
+    descriptions = [CPT_DESCRIPTIONS.get(c, "Unknown") for c in codes]
+    colors = ["#d32f2f" if cv > 0.5 else "#388e3c" for cv in cvs]
+
+    fig = go.Figure(go.Bar(
+        x=cvs,
+        y=codes,
+        orientation="h",
+        marker_color=colors,
+        customdata=descriptions,
+        hovertemplate="<b>CPT %{y}</b><br>%{customdata}<br>CV: %{x:.3f}<extra></extra>",
+    ))
+    fig.add_vline(x=0.5, line_dash="dash", line_color="black", annotation_text="CV = 0.5")
+    fig.update_layout(
+        title="Cross-Hospital Charge Variance by CPT Code",
+        xaxis_title="Coefficient of Variation (Gross Charges)",
+        yaxis=dict(tickfont=dict(size=9), dtick=1),
+        height=max(400, len(codes) * 22),
+        margin=dict(l=80),
+    )
+    fig.show()
+```
+
+## Within-Hospital Consistency
+
+Do the same codes show consistent pricing across billing classes and
+settings within a single hospital? Each box below shows the spread of
+gross charges for a CPT code across all hospitals and billing rows.
+The body spans Q1–Q3, the whiskers extend to min/max, and the line
+marks the median. Hover for details.
+
+```{python}
+codes_with_spread = (
+    medstar_f
+    .group_by("cpt_code")
+    .agg(pl.col("charge_gross").drop_nulls().len().alias("n"))
+    .filter(pl.col("n") >= 4)
+    .sort("cpt_code")
+)
+plot_codes = codes_with_spread["cpt_code"].to_list()
+
+if len(plot_codes) > 0:
+    fig = go.Figure()
+    for code in plot_codes:
+        charges = medstar_f.filter(
+            (pl.col("cpt_code") == code) & pl.col("charge_gross").is_not_null()
+        )
+        desc = CPT_DESCRIPTIONS.get(code, "Unknown")
+        fig.add_trace(go.Box(
+            y=charges["charge_gross"].to_list(),
+            name=code,
+            boxpoints="all",
+            jitter=0.4,
+            pointpos=0,
+            text=[f"{h}<br>${v:,.0f}" for h, v in zip(
+                charges["hosp_name"].to_list(),
+                charges["charge_gross"].to_list(),
+            )],
+            hovertemplate="<b>CPT %{x}</b><br>%{text}<extra>" + desc + "</extra>",
+        ))
+    fig.update_layout(
+        title="Gross Charge Dispersion by CPT Code",
+        xaxis_title="CPT Code",
+        yaxis_title="Gross Charge ($)",
+        xaxis=dict(tickfont=dict(size=8), tickangle=-45),
+        showlegend=False,
+        height=500,
+    )
+    fig.show()
+else:
+    print("Insufficient data for box plot.")
+```
+
+## Outlier Detection
+
+Hospitals with charges >2 standard deviations from the per-code mean.
+
+```{python}
+code_means = (
+    medstar_f
+    .group_by("cpt_code")
+    .agg([
+        pl.col("charge_gross").mean().alias("mean_gross"),
+        pl.col("charge_gross").std().alias("std_gross"),
+    ])
+    .filter(pl.col("std_gross").is_not_null() & (pl.col("std_gross") > 0))
+)
+
+with_stats = medstar_f.join(code_means, on="cpt_code", how="inner")
+
+outliers = with_stats.filter(
+    ((pl.col("charge_gross") - pl.col("mean_gross")).abs() / pl.col("std_gross")) > 2
+)
+
+print(f"Outlier rows (>2 SD from mean): {outliers.shape[0]}")
+if outliers.shape[0] > 0:
+    outlier_summary = (
+        outliers
+        .group_by("hosp_name")
+        .agg(pl.count().alias("n_outliers"))
+        .sort("n_outliers", descending=True)
+    )
+    print(outlier_summary)
+```
+
+```{python}
+if with_stats.shape[0] > 0:
+    scored = with_stats.with_columns(
+        ((pl.col("charge_gross") - pl.col("mean_gross")) / pl.col("std_gross")).alias("z_score")
+    ).filter(pl.col("z_score").is_not_null())
+
+    fig = go.Figure()
+    for hosp in sorted(scored["hosp_name"].unique().to_list()):
+        h_data = scored.filter(pl.col("hosp_name") == hosp)
+        fig.add_trace(go.Scatter(
+            x=h_data["cpt_code"].to_list(),
+            y=h_data["z_score"].to_list(),
+            mode="markers",
+            name=hosp,
+            marker=dict(size=6, opacity=0.7),
+            hovertemplate="<b>%{x}</b><br>Z-score: %{y:.2f}<br>" + hosp + "<extra></extra>",
+        ))
+    fig.add_hline(y=2, line_dash="dash", line_color="red", annotation_text="+2 SD")
+    fig.add_hline(y=-2, line_dash="dash", line_color="red", annotation_text="-2 SD")
+    fig.update_layout(
+        title="Charge Outliers by CPT Code (Z-Score from Cross-Hospital Mean)",
+        xaxis_title="CPT Code",
+        yaxis_title="Z-Score",
+        xaxis=dict(tickfont=dict(size=7), tickangle=-45),
+        height=450,
+        legend=dict(font=dict(size=8)),
+    )
+    fig.show()
+```
+
+## Reliability Classification
+
+A code is classified as **reliable** if:
+- CV (gross) < 0.5 *and*
+- Reported by at least 3 hospitals
+
+The recommended charge type is whichever of gross/discounted has the lower CV.
+
+```{python}
+reliability = (
+    variance_df
+    .join(episode_codes, on="cpt_code", how="left")
+    .with_columns([
+        (
+            (pl.col("cv_gross").is_not_null()) &
+            (pl.col("cv_gross") < 0.5) &
+            (pl.col("n_hospitals") >= 3)
+        ).alias("is_reliable"),
+        pl.when(
+            pl.col("cv_discounted").is_not_null() &
+            pl.col("cv_gross").is_not_null() &
+            (pl.col("cv_discounted") < pl.col("cv_gross"))
+        )
+        .then(pl.lit("charge_discounted"))
+        .otherwise(pl.lit("charge_gross"))
+        .alias("recommended_charge_type"),
+    ])
+    .select([
+        "cpt_code", "clinical_role", "n_hospitals",
+        "cv_gross", "cv_discounted",
+        "iqr_gross", "iqr_discounted",
+        "is_reliable", "recommended_charge_type",
+    ])
+)
+
+n_reliable = reliability.filter(pl.col("is_reliable")).shape[0]
+print(f"Reliable codes: {n_reliable} / {reliability.shape[0]}")
+print()
+print(reliability.sort("is_reliable", descending=True))
+```
+
+```{python}
+has_data = reliability.filter(pl.col("cv_gross").is_not_null())
+if has_data.shape[0] > 0:
+    reliable = has_data.filter(pl.col("is_reliable"))
+    unreliable = has_data.filter(~pl.col("is_reliable"))
+
+    fig = go.Figure()
+    for label, subset, color, symbol in [
+        ("Reliable", reliable, "#388e3c", "circle"),
+        ("Unreliable", unreliable, "#d32f2f", "x"),
+    ]:
+        if subset.shape[0] > 0:
+            descs = [CPT_DESCRIPTIONS.get(c, "") for c in subset["cpt_code"].to_list()]
+            fig.add_trace(go.Scatter(
+                x=subset["n_hospitals"].to_list(),
+                y=subset["cv_gross"].to_list(),
+                mode="markers+text",
+                name=label,
+                text=subset["cpt_code"].to_list(),
+                textposition="top center",
+                textfont=dict(size=7),
+                marker=dict(color=color, size=10, symbol=symbol, opacity=0.8),
+                customdata=descs,
+                hovertemplate="<b>CPT %{text}</b><br>%{customdata}<br>Hospitals: %{x}<br>CV: %{y:.3f}<extra></extra>",
+            ))
+    fig.add_hline(y=0.5, line_dash="dash", line_color="black", annotation_text="CV = 0.5")
+    fig.add_vline(x=3, line_dash="dash", line_color="black", annotation_text="n = 3")
+    fig.update_layout(
+        title="Reliability Classification: CV vs. Hospital Coverage",
+        xaxis_title="Number of Hospitals Reporting",
+        yaxis_title="Coefficient of Variation (Gross)",
+        height=500,
+    )
+    fig.show()
+```
+
+## Write Reliability Table
+
+```{python}
+out_path = INTERMEDIATE_DIR / "code_reliability.parquet"
+reliability.write_parquet(out_path)
+print(f"Wrote {reliability.shape[0]} rows to {out_path}")
+```

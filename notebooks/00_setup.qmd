@@ -34,18 +34,68 @@ The codes below were provided as the episode definition. Some categories
 procedure — downstream notebooks will surface those gaps.
 
 ```{python}
-from _common import build_episode_codes_df, INTERMEDIATE_DIR, _CODE_GROUPS
+import plotly.graph_objects as go
+from _common import build_episode_codes_df, INTERMEDIATE_DIR, _CODE_GROUPS, CPT_DESCRIPTIONS
 
 episode_codes = build_episode_codes_df()
 print(f"Total episode codes: {episode_codes.shape[0]}")
 print(f"Clinical roles: {episode_codes['clinical_role'].n_unique()}")
-print()
+```
+
+```{python}
+setting_colors = {"inpatient": "#d32f2f", "outpatient": "#1976d2", "both": "#7b1fa2"}
+
+labels, parents, values, colors, hovers = [], [], [], [], []
+
+labels.append("Episode Bundle")
+parents.append("")
+values.append(0)
+colors.append("#ffffff")
+hovers.append(f"{episode_codes.shape[0]} total codes")
+
+for setting in ["inpatient", "outpatient", "both"]:
+    subset = episode_codes.filter(episode_codes["setting"] == setting)
+    if subset.shape[0] == 0:
+        continue
+    labels.append(setting)
+    parents.append("Episode Bundle")
+    values.append(0)
+    colors.append(setting_colors[setting])
+    hovers.append(f"{subset.shape[0]} codes")
 
 for role in episode_codes["clinical_role"].unique().sort().to_list():
     subset = episode_codes.filter(episode_codes["clinical_role"] == role)
-    codes = subset["cpt_code"].to_list()
     setting = subset["setting"][0]
-    print(f"  {role} ({setting}): {', '.join(codes)}")
+    labels.append(role)
+    parents.append(setting)
+    values.append(0)
+    colors.append(setting_colors[setting])
+    hovers.append(f"{subset.shape[0]} codes")
+
+    for code in subset["cpt_code"].to_list():
+        desc = CPT_DESCRIPTIONS.get(code, "")
+        labels.append(code)
+        parents.append(role)
+        values.append(1)
+        colors.append(setting_colors[setting])
+        hovers.append(f"CPT {code}<br>{desc}")
+
+fig = go.Figure(go.Sunburst(
+    labels=labels,
+    parents=parents,
+    values=values,
+    marker=dict(colors=colors),
+    branchvalues="total",
+    hovertext=hovers,
+    hoverinfo="text",
+    maxdepth=3,
+))
+fig.update_layout(
+    title="Episode CPT Code Bundle",
+    height=600,
+    margin=dict(t=40, b=10, l=10, r=10),
+)
+fig.show()
 ```
 
 ## Write Episode Codes to Parquet

@@ -33,7 +33,7 @@ def test_biopsy_code_present():
 def test_build_episode_codes_df_schema():
     df = C.build_episode_codes_df()
     assert df.columns == ["cpt_code", "clinical_role", "setting"]
-    assert df.shape[0] > 60
+    assert df.shape[0] > 15
 
 
 def test_build_episode_codes_df_no_duplicates():

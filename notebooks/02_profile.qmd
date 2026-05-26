@@ -1,0 +1,190 @@
+---
+title: "02 — Data Profiling & Quality"
+description: |
+  Assesses whether the MedStar charge data is complete and internally
+  consistent enough to support downstream cost modeling.
+dependencies:
+  - data/intermediate/medstar_charges.parquet
+  - data/intermediate/episode_codes.parquet
+format: html
+jupyter: python3
+---
+
+## Load Data
+
+```{python}
+import polars as pl
+import plotly.graph_objects as go
+from _common import INTERMEDIATE_DIR, CHARGE_COLS, CPT_DESCRIPTIONS
+
+medstar = pl.read_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+episode_codes = pl.read_parquet(INTERMEDIATE_DIR / "episode_codes.parquet")
+print(f"MedStar rows: {medstar.shape[0]:,}")
+```
+
+## Charge Column Completeness
+
+How much of each charge column is actually populated? Null values mean the
+hospital didn't report that charge type; zeros may indicate free services
+or data entry gaps.
+
+```{python}
+total = medstar.shape[0]
+stats_rows = []
+
+for col in CHARGE_COLS:
+    series = medstar[col]
+    null_count = series.null_count()
+    numeric = series.drop_nulls().cast(pl.Float64, strict=False).drop_nulls()
+    zero_count = (numeric == 0).sum()
+    stats_rows.append({
+        "column": col,
+        "null_rate": round(null_count / total, 3),
+        "zero_rate": round(zero_count / total, 3) if len(numeric) > 0 else None,
+    })
+
+cols = [r["column"] for r in stats_rows]
+null_rates = [r["null_rate"] for r in stats_rows]
+zero_rates = [r["zero_rate"] or 0 for r in stats_rows]
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    y=cols, x=null_rates, orientation="h", name="Null Rate",
+    marker_color="#d32f2f",
+    hovertemplate="%{y}<br>Null: %{x:.1%}<extra></extra>",
+))
+fig.add_trace(go.Bar(
+    y=cols, x=zero_rates, orientation="h", name="Zero Rate",
+    marker_color="#ff9800",
+    hovertemplate="%{y}<br>Zero: %{x:.1%}<extra></extra>",
+))
+fig.update_layout(
+    barmode="group",
+    title="Charge Column Completeness",
+    xaxis_title="Rate",
+    xaxis=dict(tickformat=".0%"),
+    height=300,
+    margin=dict(l=140),
+)
+fig.show()
+```
+
+## Code Coverage
+
+Do we have charge data for all 21 episode CPT codes? Each dot represents
+one code — green if found in at least one hospital's data, red if absent
+entirely.
+
+```{python}
+codes_in_data = set(medstar["cpt_code"].unique().to_list())
+codes_expected = episode_codes.sort("clinical_role", "cpt_code")
+
+statuses = []
+for row in codes_expected.iter_rows(named=True):
+    code = row["cpt_code"]
+    statuses.append({
+        "cpt_code": code,
+        "clinical_role": row["clinical_role"],
+        "found": code in codes_in_data,
+        "desc": CPT_DESCRIPTIONS.get(code, ""),
+    })
+
+found_count = sum(1 for s in statuses if s["found"])
+labels = [s["cpt_code"] for s in statuses]
+colors = ["#388e3c" if s["found"] else "#d32f2f" for s in statuses]
+descs = [s["desc"] for s in statuses]
+roles = [s["clinical_role"] for s in statuses]
+
+fig = go.Figure(go.Scatter(
+    x=list(range(len(labels))),
+    y=[1] * len(labels),
+    mode="markers",
+    marker=dict(size=18, color=colors, symbol="circle"),
+    text=labels,
+    customdata=list(zip(descs, roles, ["Found" if s["found"] else "Missing" for s in statuses])),
+    hovertemplate="<b>CPT %{text}</b><br>%{customdata[0]}<br>Role: %{customdata[1]}<br>%{customdata[2]}<extra></extra>",
+))
+fig.update_layout(
+    title=f"Episode Code Coverage: {found_count}/{len(statuses)} found",
+    xaxis=dict(tickvals=list(range(len(labels))), ticktext=labels, tickangle=-45, tickfont=dict(size=8)),
+    yaxis=dict(visible=False),
+    height=200,
+    margin=dict(t=50, b=80, l=20, r=20),
+    showlegend=False,
+)
+fig.show()
+```
+
+## Structural Anomalies
+
+Checks for rows where charge values are internally contradictory — these
+indicate data entry errors or reporting inconsistencies.
+
+```{python}
+has_min_max = medstar.filter(
+    pl.col("charge_min").is_not_null() & pl.col("charge_max").is_not_null()
+)
+min_gt_max = has_min_max.filter(
+    pl.col("charge_min").cast(pl.Float64) > pl.col("charge_max").cast(pl.Float64)
+)
+
+has_gross_disc = medstar.filter(
+    pl.col("charge_gross").is_not_null() & pl.col("charge_discounted").is_not_null()
+)
+gross_lt_disc = has_gross_disc.filter(
+    pl.col("charge_gross").cast(pl.Float64) < pl.col("charge_discounted").cast(pl.Float64)
+)
+
+anomalies = [
+    {"type": "min > max", "count": min_gt_max.shape[0], "checked": has_min_max.shape[0]},
+    {"type": "gross < discounted", "count": gross_lt_disc.shape[0], "checked": has_gross_disc.shape[0]},
+]
+anomaly_df = pl.DataFrame(anomalies)
+
+fig = go.Figure(go.Bar(
+    y=[a["type"] for a in anomalies],
+    x=[a["count"] for a in anomalies],
+    orientation="h",
+    marker_color="#d32f2f",
+    customdata=[a["checked"] for a in anomalies],
+    hovertemplate="<b>%{y}</b><br>%{x} of %{customdata} rows<extra></extra>",
+))
+fig.update_layout(
+    title="Structural Anomalies",
+    xaxis_title="Row Count",
+    height=200,
+    margin=dict(l=180, t=40, b=30),
+)
+fig.show()
+```
+
+## Verdict
+
+```{python}
+found = sum(1 for s in statuses if s["found"])
+missing = sum(1 for s in statuses if not s["found"])
+total_anomalies = sum(a["count"] for a in anomalies)
+worst_null = max(stats_rows, key=lambda r: r["null_rate"])
+
+print("DATA QUALITY VERDICT")
+print()
+print(f"  Completeness: {worst_null['column']} has the highest null rate "
+      f"at {worst_null['null_rate']:.1%}")
+print(f"  Code coverage: {found}/{found + missing} episode codes present")
+print(f"  Anomalies: {total_anomalies} structurally inconsistent rows")
+print()
+if worst_null["null_rate"] > 0.5:
+    print("  ⚠ High null rates in one or more charge columns — downstream")
+    print("    analysis should prefer columns with better coverage.")
+if missing > 0:
+    missing_codes = [s["cpt_code"] for s in statuses if not s["found"]]
+    print(f"  ⚠ Missing codes: {', '.join(missing_codes)}")
+    print("    Episode cost estimates will be incomplete for these components.")
+if total_anomalies == 0:
+    print("  ✓ No structural anomalies detected.")
+else:
+    print(f"  ⚠ {total_anomalies} rows with contradictory values — minor impact")
+    print("    on medians but worth noting.")
+print()
+print("  Proceed to variance analysis (03) with awareness of gaps above.")
+```

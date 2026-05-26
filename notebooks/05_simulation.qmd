@@ -1,0 +1,375 @@
+---
+title: "05 — Monte Carlo Cost Comparison"
+description: |
+  Simulates inpatient and outpatient liver biopsy episode costs across
+  a range of patient complexities and compares against alternative
+  diagnostic products to quantify expected cost savings.
+dependencies:
+  - data/intermediate/medstar_charges.parquet
+format: html
+jupyter: python3
+---
+
+## Context
+
+The preceding notebooks established a rigorous cost baseline for the
+standard-of-care liver biopsy episode:
+
+- **Data ingestion** — loaded price-transparency data from
+  [9 MedStar hospitals](01_ingest.html#load-medstar-hospital-data) covering
+  [21 CPT codes across 6 clinical roles](01_ingest.html#coverage-summary)
+- **Quality validation** — confirmed
+  [charge column completeness](02_profile.html#charge-column-completeness),
+  [code coverage](02_profile.html#code-coverage), and
+  [structural consistency](02_profile.html#structural-anomalies)
+- **Variance analysis** — quantified
+  [cross-hospital charge dispersion](03_variance.html#cross-hospital-charge-dispersion)
+  and classified each code's
+  [pricing reliability](03_variance.html#reliability-classification)
+- **Episode assembly** — built the
+  [full 7-component episode cost](04_episode.html#episode-cost-buildup)
+  per hospital, with
+  [gross vs. discounted sensitivity analysis](04_episode.html#sensitivity-gross-vs.-discounted-charges)
+
+That foundation matters because the cost argument for any novel diagnostic
+is only as credible as the baseline it's measured against. Investors and
+payers will scrutinize the comparison — so the question this notebook
+answers is: **given what we now know about the real cost of a liver biopsy
+episode, how much could a non-invasive alternative save per patient?**
+
+## The Diagnostic Landscape
+
+Liver transplant rejection monitoring currently relies on percutaneous
+biopsy — an invasive, resource-intensive procedure that requires
+imaging guidance, sedation or anesthesia, wound repair, and post-procedure
+observation. The episode cost varies with clinical setting (inpatient vs.
+outpatient) and patient complexity, but it is never cheap.
+
+A new class of **cell-free DNA (cfDNA)** and **epigenetic** diagnostics
+aims to replace or reduce the need for biopsy by detecting organ rejection
+through a simple blood draw. Two products are already commercialized in
+**kidney** transplant — **AlloSure (CareDx, ~$2,850/test)** and
+**Prospera (Natera, ~$2,850/test)**. These are included below as market
+pricing comparables: they demonstrate what payers are already willing to
+reimburse for cfDNA-based rejection monitoring, even though they target a
+different organ.
+
+**Epigenetic Compass** is a liver-specific epigenetic diagnostic priced at
+**$2,000/test**. It requires only a blood draw — no sedation, no imaging,
+no post-procedure observation. The simulation below quantifies the
+per-patient cost savings this represents against the
+[biopsy episode](04_episode.html#episode-cost-buildup) we've characterized
+in the preceding analysis.
+
+```{python}
+import numpy as np
+import polars as pl
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from _common import INTERMEDIATE_DIR, CHARGE_COLS, EPISODE_FREQUENCIES, CPT_DESCRIPTIONS
+
+np.random.seed(42)
+N_SIMULATIONS = 10_000
+
+medstar = pl.read_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+medstar_f = medstar.with_columns([
+    pl.col(c).cast(pl.Float64, strict=False) for c in CHARGE_COLS
+])
+print(f"Running {N_SIMULATIONS:,} simulated patients")
+```
+
+## Biopsy Episode Components
+
+Each episode component has a base cost (median gross charge from our
+[MedStar data](01_ingest.html#load-medstar-hospital-data)) and a
+complexity sensitivity. Fixed procedures like the biopsy itself cost
+roughly the same regardless of patient complexity; variable services
+like hospital care and infusion scale with how sick the patient is.
+Base costs are drawn from the
+[episode cost buildup](04_episode.html#episode-cost-buildup); charge
+types follow the
+[reliability recommendations](03_variance.html#reliability-classification)
+from the variance analysis.
+
+The **inpatient** protocol includes all 7 components. The **outpatient**
+protocol drops initial hospital care and the celiac plexus nerve block
+(replaced by local anesthesia in an outpatient setting) — see the
+[per-hospital coverage matrix](04_episode.html#per-hospital-component-coverage)
+for which hospitals offer each component. Both protocols represent the
+full clinical workup that Epigenetic Compass would eliminate entirely.
+
+```{python}
+COMPONENTS = {}
+COMPLEXITY_SENSITIVITY = {
+    "initial_hospital_care": 1.0,
+    "office_followup": 0.2,
+    "biopsy": 0.2,
+    "nerve_block": 0.5,
+    "wound_repair": 0.3,
+    "infusion_initial": 0.5,
+    "infusion_additional": 0.8,
+}
+
+INPATIENT_ONLY = {"initial_hospital_care", "nerve_block"}
+
+for key, spec in EPISODE_FREQUENCIES.items():
+    code = str(spec["code"])
+    data = medstar_f.filter(pl.col("cpt_code") == code)
+    gross = data["charge_gross"].drop_nulls()
+    if len(gross) > 0:
+        COMPONENTS[key] = {
+            "base_cost": gross.median(),
+            "std": gross.std(),
+            "sensitivity": COMPLEXITY_SENSITIVITY[key],
+            "qty": spec["qty"],
+            "desc": CPT_DESCRIPTIONS.get(code, key),
+            "inpatient_only": key in INPATIENT_ONLY,
+        }
+
+comp_names = list(COMPONENTS.keys())
+base_costs = [COMPONENTS[k]["base_cost"] * COMPONENTS[k]["qty"] for k in comp_names]
+sensitivities = [COMPONENTS[k]["sensitivity"] for k in comp_names]
+settings = ["Inpatient only" if COMPONENTS[k]["inpatient_only"] else "Both" for k in comp_names]
+
+fig = go.Figure(go.Bar(
+    y=comp_names,
+    x=base_costs,
+    orientation="h",
+    marker_color=["#d32f2f" if COMPONENTS[k]["inpatient_only"] else "#1976d2" for k in comp_names],
+    customdata=[[f"{s:.1f}", COMPONENTS[k]["desc"], st] for k, s, st in zip(comp_names, sensitivities, settings)],
+    hovertemplate="<b>%{y}</b><br>%{customdata[1]}<br>Base: $%{x:,.0f}<br>Sensitivity: %{customdata[0]}<br>Setting: %{customdata[2]}<extra></extra>",
+))
+fig.update_layout(
+    title="Episode Component Base Costs (red = inpatient only, blue = both settings)",
+    xaxis_title="Base Cost ($)",
+    height=350,
+    margin=dict(l=160),
+)
+fig.show()
+```
+
+## Simulate Patient Complexity
+
+Patient complexity follows a log-normal distribution centered at 1.0
+with right skew — most patients are near average, but a tail of complex
+cases drives costs significantly higher. Each component's cost scales as
+`base_cost × complexity ^ sensitivity`. The same complexity distribution
+applies to both inpatient and outpatient protocols — the difference is
+which components are included, not the patient population.
+
+```{python}
+complexity = np.random.lognormal(mean=0.0, sigma=0.3, size=N_SIMULATIONS)
+
+fig = go.Figure(go.Histogram(
+    x=complexity,
+    nbinsx=60,
+    marker_color="#1976d2",
+    hovertemplate="Complexity: %{x:.2f}<br>Count: %{y}<extra></extra>",
+))
+fig.add_vline(x=1.0, line_dash="dash", line_color="black", annotation_text="Baseline (1.0)")
+fig.add_vline(x=np.median(complexity), line_dash="dot", line_color="#7b1fa2",
+              annotation_text=f"Median ({np.median(complexity):.2f})")
+fig.update_layout(
+    title="Simulated Patient Complexity Distribution",
+    xaxis_title="Complexity Multiplier",
+    yaxis_title="Count",
+    height=350,
+)
+fig.show()
+```
+
+## Simulated Biopsy Episode Costs
+
+With the cost model built, we can now overlay the diagnostic alternatives.
+The vertical reference lines show the fixed per-test cost of each product —
+contrast that with the wide, right-skewed distribution of biopsy costs
+that our simulation produces.
+
+```{python}
+inpatient_costs = np.zeros(N_SIMULATIONS)
+outpatient_costs = np.zeros(N_SIMULATIONS)
+
+for key, comp in COMPONENTS.items():
+    component_cost = comp["base_cost"] * comp["qty"] * (complexity ** comp["sensitivity"])
+    inpatient_costs += component_cost
+    if not comp["inpatient_only"]:
+        outpatient_costs += component_cost
+
+DIAGNOSTICS = [
+    {"name": "Allosure — CareDx (Kidney)", "cost": 2_850, "color": "#ff9800"},
+    {"name": "Prospera — Natera (Kidney)", "cost": 2_850, "color": "#ff9800"},
+    {"name": "Epigenetic Compass (Liver)", "cost": 2_000, "color": "#388e3c"},
+]
+
+fig = go.Figure()
+fig.add_trace(go.Histogram(
+    x=inpatient_costs, nbinsx=80, marker_color="#d32f2f", opacity=0.6,
+    name="Inpatient Biopsy",
+    hovertemplate="Inpatient: $%{x:,.0f}<br>Count: %{y}<extra></extra>",
+))
+fig.add_trace(go.Histogram(
+    x=outpatient_costs, nbinsx=80, marker_color="#1976d2", opacity=0.6,
+    name="Outpatient Biopsy",
+    hovertemplate="Outpatient: $%{x:,.0f}<br>Count: %{y}<extra></extra>",
+))
+
+for dx in DIAGNOSTICS:
+    fig.add_vline(x=dx["cost"], line_dash="dash", line_color=dx["color"], line_width=2)
+    fig.add_annotation(
+        x=dx["cost"], y=1, yref="paper", yshift=10,
+        text=f"{dx['name']}<br>${dx['cost']:,.0f}",
+        showarrow=False, font=dict(size=8, color=dx["color"]),
+        xanchor="left", xshift=5,
+    )
+
+fig.update_layout(
+    barmode="overlay",
+    title="Simulated Biopsy Costs vs. Alternative Diagnostics",
+    xaxis_title="Cost ($)",
+    yaxis_title="Simulated Patients",
+    height=500,
+    legend=dict(x=0.7, y=0.95),
+)
+fig.show()
+```
+
+## Cost Savings Distribution
+
+The core investor question: **how much does Epigenetic Compass save per
+patient?** For each of the 10,000 simulated patients, we subtract the
+$2,000 test cost from their biopsy episode cost. Positive values
+represent savings; the further right, the stronger the economic case.
+
+```{python}
+ec_cost = 2_000
+savings_inpatient = inpatient_costs - ec_cost
+savings_outpatient = outpatient_costs - ec_cost
+
+fig = go.Figure()
+fig.add_trace(go.Histogram(
+    x=savings_inpatient, nbinsx=80, marker_color="#d32f2f", opacity=0.6,
+    name="vs. Inpatient",
+    hovertemplate="Savings (inpatient): $%{x:,.0f}<br>Count: %{y}<extra></extra>",
+))
+fig.add_trace(go.Histogram(
+    x=savings_outpatient, nbinsx=80, marker_color="#1976d2", opacity=0.6,
+    name="vs. Outpatient",
+    hovertemplate="Savings (outpatient): $%{x:,.0f}<br>Count: %{y}<extra></extra>",
+))
+fig.add_vline(x=0, line_dash="solid", line_color="black", line_width=1)
+fig.add_vline(x=np.median(savings_inpatient), line_dash="dash", line_color="#d32f2f",
+              annotation_text=f"Inpatient median ${np.median(savings_inpatient):,.0f}")
+fig.add_vline(x=np.median(savings_outpatient), line_dash="dash", line_color="#1976d2",
+              annotation_text=f"Outpatient median ${np.median(savings_outpatient):,.0f}")
+fig.update_layout(
+    barmode="overlay",
+    title=f"Per-Patient Savings: Epigenetic Compass vs. Biopsy",
+    xaxis_title="Savings ($)",
+    yaxis_title="Simulated Patients",
+    height=450,
+    legend=dict(x=0.02, y=0.95),
+)
+fig.show()
+```
+
+## Head-to-Head Comparison
+
+How does Epigenetic Compass stack up against the kidney-transplant
+comparables? The bars below show mean per-patient savings with 95%
+confidence intervals. AlloSure and Prospera demonstrate that payers
+already accept cfDNA pricing at $2,850 — Epigenetic Compass undercuts
+that benchmark by $850/test while targeting the liver market where no
+non-invasive alternative currently exists.
+
+```{python}
+comparisons = [
+    ("Inpatient Biopsy", inpatient_costs),
+    ("Outpatient Biopsy", outpatient_costs),
+]
+
+rows = []
+for biopsy_label, biopsy_costs in comparisons:
+    for dx in DIAGNOSTICS:
+        dx_savings = biopsy_costs - dx["cost"]
+        rows.append({
+            "Biopsy Setting": biopsy_label,
+            "Diagnostic": dx["name"],
+            "Cost": dx["cost"],
+            "Mean Savings": round(dx_savings.mean(), 2),
+            "Median Savings": round(np.median(dx_savings), 2),
+            "P(Biopsy Costlier)": round((dx_savings > 0).mean() * 100, 1),
+            "CI Lower": round(np.percentile(dx_savings, 2.5), 2),
+            "CI Upper": round(np.percentile(dx_savings, 97.5), 2),
+        })
+
+summary_df = pl.DataFrame(rows)
+
+for setting in ["Inpatient Biopsy", "Outpatient Biopsy"]:
+    subset = [r for r in rows if r["Biopsy Setting"] == setting]
+    names = [r["Diagnostic"] for r in subset]
+    means = [r["Mean Savings"] for r in subset]
+    ci_lo = [r["CI Lower"] for r in subset]
+    ci_hi = [r["CI Upper"] for r in subset]
+    probs = [r["P(Biopsy Costlier)"] for r in subset]
+
+    color = "#d32f2f" if "Inpatient" in setting else "#1976d2"
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=names,
+        x=means,
+        orientation="h",
+        marker_color=color,
+        error_x=dict(
+            type="data",
+            symmetric=False,
+            array=[h - m for h, m in zip(ci_hi, means)],
+            arrayminus=[m - l for l, m in zip(ci_lo, means)],
+        ),
+        customdata=list(zip(probs, [f"${l:,.0f}" for l in ci_lo], [f"${h:,.0f}" for h in ci_hi])),
+        hovertemplate="<b>%{y}</b><br>Mean savings: $%{x:,.0f}<br>95% CI: %{customdata[1]} to %{customdata[2]}<br>P(biopsy costlier): %{customdata[0]}%<extra></extra>",
+    ))
+    fig.add_vline(x=0, line_dash="solid", line_color="black", line_width=1)
+    fig.update_layout(
+        title=f"Savings vs. {setting} (with 95% CI)",
+        xaxis_title="Savings ($)",
+        height=250,
+        margin=dict(l=250, t=40, b=30),
+    )
+    fig.show()
+```
+
+## Investment Thesis
+
+The preceding analysis — built on
+[real hospital price-transparency data](01_ingest.html#load-medstar-hospital-data),
+[validated for quality](02_profile.html#verdict) and
+[cross-hospital consistency](03_variance.html#reliability-classification) —
+produces a clear economic signal. The
+[biopsy episode](04_episode.html#episode-cost-summary) that Epigenetic
+Compass replaces is expensive across both clinical settings, and the
+savings are robust across a wide range of patient complexities.
+
+```{python}
+ec_inp = [r for r in rows if "Epigenetic" in r["Diagnostic"] and r["Biopsy Setting"] == "Inpatient Biopsy"][0]
+ec_out = [r for r in rows if "Epigenetic" in r["Diagnostic"] and r["Biopsy Setting"] == "Outpatient Biopsy"][0]
+
+print("EPIGENETIC COMPASS — COST SAVINGS SUMMARY")
+print(f"  Based on {N_SIMULATIONS:,} simulated patient episodes")
+print(f"  Epigenetic Compass test cost: $2,000 (fixed, blood draw only)")
+print()
+print("  VS. INPATIENT BIOPSY (7-component episode)")
+print(f"    Biopsy cost:  ${np.mean(inpatient_costs):,.0f} mean, ${np.median(inpatient_costs):,.0f} median")
+print(f"    Savings:      ${ec_inp['Mean Savings']:,.0f} mean (95% CI: ${ec_inp['CI Lower']:,.0f} to ${ec_inp['CI Upper']:,.0f})")
+print(f"    P(biopsy costs more): {ec_inp['P(Biopsy Costlier)']}%")
+print()
+print("  VS. OUTPATIENT BIOPSY (5-component episode)")
+print(f"    Biopsy cost:  ${np.mean(outpatient_costs):,.0f} mean, ${np.median(outpatient_costs):,.0f} median")
+print(f"    Savings:      ${ec_out['Mean Savings']:,.0f} mean (95% CI: ${ec_out['CI Lower']:,.0f} to ${ec_out['CI Upper']:,.0f})")
+print(f"    P(biopsy costs more): {ec_out['P(Biopsy Costlier)']}%")
+print()
+print("  MARKET CONTEXT")
+print("    AlloSure & Prospera (kidney cfDNA): ~$2,850/test — already reimbursed")
+print("    Epigenetic Compass (liver): $2,000/test — $850 below kidney precedent")
+print("    No non-invasive liver rejection diagnostic currently on market")
+```

@@ -77,31 +77,67 @@ print(f"Unique CPT codes found: {medstar['cpt_code'].n_unique()}")
 ## Coverage Summary
 
 ```{python}
-summary = (
-    medstar
-    .group_by("hosp_name")
-    .agg(
-        pl.count().alias("row_count"),
-        pl.col("cpt_code").n_unique().alias("unique_codes"),
-    )
-    .sort("hosp_name")
+import plotly.graph_objects as go
+
+merged = medstar.join(episode_codes, on="cpt_code", how="left")
+
+hosp_role = (
+    merged
+    .group_by(["hosp_name", "clinical_role"])
+    .agg(pl.count().alias("n_rows"))
 )
-print(summary)
+
+hospitals = sorted(merged["hosp_name"].unique().to_list())
+roles = sorted(merged["clinical_role"].drop_nulls().unique().to_list())
+
+fig = go.Figure()
+for role in roles:
+    role_data = hosp_role.filter(pl.col("clinical_role") == role)
+    counts = []
+    for h in hospitals:
+        row = role_data.filter(pl.col("hosp_name") == h)
+        counts.append(row["n_rows"][0] if row.shape[0] > 0 else 0)
+    fig.add_trace(go.Bar(
+        name=role, y=hospitals, x=counts, orientation="h",
+        hovertemplate="<b>%{y}</b><br>" + role + ": %{x}<extra></extra>",
+    ))
+
+fig.update_layout(
+    barmode="stack",
+    title="Charge Rows per Hospital by Clinical Role",
+    xaxis_title="Row Count",
+    yaxis=dict(showticklabels=False),
+    height=450,
+    legend=dict(font=dict(size=8), orientation="h", y=-0.25),
+    margin=dict(l=20),
+)
+fig.show()
 ```
 
 ```{python}
 by_role = (
-    medstar
-    .join(episode_codes, on="cpt_code", how="left")
+    merged
     .group_by("clinical_role")
-    .agg(
-        pl.count().alias("row_count"),
-        pl.col("cpt_code").n_unique().alias("unique_codes"),
-        pl.col("hosp_name").n_unique().alias("hospitals_reporting"),
-    )
-    .sort("clinical_role")
+    .agg(pl.col("hosp_name").n_unique().alias("hospitals_reporting"))
+    .sort("hospitals_reporting")
 )
-print(by_role)
+
+fig = go.Figure(go.Bar(
+    y=by_role["clinical_role"].to_list(),
+    x=by_role["hospitals_reporting"].to_list(),
+    orientation="h",
+    marker_color="#1976d2",
+    hovertemplate="<b>%{y}</b><br>%{x} of 9 hospitals<extra></extra>",
+))
+fig.add_vline(x=9, line_dash="dash", line_color="#d32f2f", annotation_text="All 9 hospitals")
+fig.update_layout(
+    title="Hospital Coverage by Clinical Role",
+    xaxis_title="Hospitals Reporting",
+    xaxis=dict(dtick=1),
+    height=350,
+    margin=dict(l=160),
+)
+fig.show()
 ```
 
 ## Load CMS MPFS National Data
