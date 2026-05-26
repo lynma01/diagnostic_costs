@@ -1,0 +1,162 @@
+---
+title: "02 — Data Profiling & Quality"
+description: |
+  Profiles the MedStar charge data: null/zero rates per charge column,
+  coverage matrix across hospitals and codes, and anomaly detection.
+dependencies:
+  - data/intermediate/medstar_charges.parquet
+  - data/intermediate/episode_codes.parquet
+format: html
+jupyter: python3
+---
+
+## Load Data
+
+```{python}
+import polars as pl
+import matplotlib.pyplot as plt
+import numpy as np
+from _common import INTERMEDIATE_DIR, CHARGE_COLS
+
+medstar = pl.read_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+episode_codes = pl.read_parquet(INTERMEDIATE_DIR / "episode_codes.parquet")
+print(f"MedStar rows: {medstar.shape[0]:,}")
+```
+
+## Charge Column Summary Statistics
+
+For each charge column, we compute null rate, zero rate, and basic
+distribution statistics to understand data completeness.
+
+```{python}
+total = medstar.shape[0]
+stats_rows = []
+
+for col in CHARGE_COLS:
+    series = medstar[col]
+    null_count = series.null_count()
+    numeric = series.drop_nulls().cast(pl.Float64, strict=False).drop_nulls()
+    zero_count = (numeric == 0).sum()
+    stats_rows.append({
+        "column": col,
+        "null_rate": round(null_count / total, 3),
+        "zero_rate": round(zero_count / total, 3) if len(numeric) > 0 else None,
+        "mean": round(numeric.mean(), 2) if len(numeric) > 0 else None,
+        "median": round(numeric.median(), 2) if len(numeric) > 0 else None,
+        "std": round(numeric.std(), 2) if len(numeric) > 0 else None,
+        "min": round(numeric.min(), 2) if len(numeric) > 0 else None,
+        "max": round(numeric.max(), 2) if len(numeric) > 0 else None,
+    })
+
+stats_df = pl.DataFrame(stats_rows)
+print(stats_df)
+```
+
+## Coverage Matrix: Hospitals × Clinical Roles
+
+This heatmap shows how many charge rows each hospital reports per clinical
+role. Empty cells indicate codes not found in that hospital's data.
+
+```{python}
+merged = medstar.join(episode_codes, on="cpt_code", how="left")
+
+coverage = (
+    merged
+    .group_by(["hosp_name", "clinical_role"])
+    .agg(pl.count().alias("n_rows"))
+    .pivot(on="clinical_role", index="hosp_name", values="n_rows")
+    .fill_null(0)
+    .sort("hosp_name")
+)
+
+hospitals = coverage["hosp_name"].to_list()
+roles = [c for c in coverage.columns if c != "hosp_name"]
+matrix = coverage.select(roles).to_numpy()
+
+fig, ax = plt.subplots(figsize=(14, 6))
+im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+ax.set_xticks(range(len(roles)))
+ax.set_xticklabels(roles, rotation=45, ha="right", fontsize=8)
+ax.set_yticks(range(len(hospitals)))
+ax.set_yticklabels(hospitals, fontsize=8)
+plt.colorbar(im, label="Row count")
+ax.set_title("Coverage: MedStar Hospitals × Clinical Roles")
+plt.tight_layout()
+plt.show()
+```
+
+## Code-Level Coverage
+
+Which episode codes are present vs. absent across hospitals?
+
+```{python}
+codes_in_data = set(medstar["cpt_code"].unique().to_list())
+codes_expected = set(episode_codes["cpt_code"].to_list())
+
+found = codes_expected & codes_in_data
+missing = codes_expected - codes_in_data
+
+print(f"Episode codes found in data: {len(found)} / {len(codes_expected)}")
+if missing:
+    missing_roles = (
+        episode_codes
+        .filter(pl.col("cpt_code").is_in(list(missing)))
+        .group_by("clinical_role")
+        .agg(pl.col("cpt_code").count().alias("n_missing"))
+        .sort("n_missing", descending=True)
+    )
+    print(f"\nMissing codes by clinical role:")
+    print(missing_roles)
+```
+
+## Anomaly Detection
+
+Flag rows where charge values are internally inconsistent.
+
+```{python}
+anomalies = []
+
+has_min_max = medstar.filter(
+    pl.col("charge_min").is_not_null() & pl.col("charge_max").is_not_null()
+)
+min_gt_max = has_min_max.filter(
+    pl.col("charge_min").cast(pl.Float64) > pl.col("charge_max").cast(pl.Float64)
+)
+anomalies.append({"type": "min > max", "count": min_gt_max.shape[0]})
+
+has_gross_disc = medstar.filter(
+    pl.col("charge_gross").is_not_null() & pl.col("charge_discounted").is_not_null()
+)
+gross_lt_disc = has_gross_disc.filter(
+    pl.col("charge_gross").cast(pl.Float64) < pl.col("charge_discounted").cast(pl.Float64)
+)
+anomalies.append({"type": "gross < discounted", "count": gross_lt_disc.shape[0]})
+
+for col in CHARGE_COLS:
+    n_zero = medstar.filter(
+        pl.col(col).is_not_null() & (pl.col(col).cast(pl.Float64) == 0)
+    ).shape[0]
+    anomalies.append({"type": f"zero {col}", "count": n_zero})
+
+anomaly_df = pl.DataFrame(anomalies)
+print(anomaly_df)
+```
+
+## Assessment
+
+```{python}
+print("=" * 60)
+print("DATA QUALITY ASSESSMENT")
+print("=" * 60)
+print()
+for row in stats_rows:
+    col = row["column"]
+    null_pct = row["null_rate"] * 100
+    status = "GOOD" if null_pct < 10 else "CAUTION" if null_pct < 50 else "POOR"
+    print(f"  {col}: {null_pct:.1f}% null — {status}")
+print()
+print(f"  Codes found: {len(found)}/{len(codes_expected)}")
+print(f"  Codes missing entirely: {len(missing)}")
+print()
+print("See coverage heatmap above for per-hospital detail.")
+```
