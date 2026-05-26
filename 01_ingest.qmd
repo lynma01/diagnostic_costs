@@ -1,0 +1,160 @@
+---
+title: "01 — Data Ingestion"
+description: |
+  Loads MedStar hospital price transparency CSVs and CMS MPFS national data,
+  filters to episode-relevant CPT codes, standardizes columns, and writes
+  Parquet intermediates.
+dependencies:
+  - data/intermediate/episode_codes.parquet
+format: html
+jupyter: python3
+---
+
+## Load Episode Codes
+
+```{python}
+import polars as pl
+from _common import (
+    INTERMEDIATE_DIR, CMS_DIR, MEDSTAR_HOSPITALS, COLUMN_MAP,
+    CHARGE_COLS, get_connection, standardize_columns,
+)
+
+episode_codes = pl.read_parquet(INTERMEDIATE_DIR / "episode_codes.parquet")
+episode_cpt_set = set(episode_codes["cpt_code"].to_list())
+print(f"Filtering to {len(episode_cpt_set)} episode CPT codes")
+```
+
+## Load MedStar Hospital Data
+
+Each hospital's price transparency CSV is read directly from the MedStar URL.
+We union all hospitals, filter to episode-relevant CPT codes, and standardize
+column names.
+
+```{python}
+con = get_connection()
+
+cte_parts = []
+for name, url in MEDSTAR_HOSPITALS.items():
+    cte_parts.append(f"""
+    {name} AS (
+        SELECT
+            description,
+            "code|1", "code|1|type",
+            "code|3", "code|3|type",
+            setting, billing_class,
+            "standard_charge|gross",
+            "standard_charge|min",
+            "standard_charge|max",
+            "standard_charge|discounted_cash",
+            '{name}' AS hosp_name
+        FROM read_csv('{url}', skip=2, sample_size=-1, ignore_errors=true)
+    )""")
+
+union_parts = " UNION ALL ".join(
+    f"SELECT * FROM {name}" for name in MEDSTAR_HOSPITALS
+)
+
+sql = f"""
+WITH {','.join(cte_parts)}
+SELECT * FROM ({union_parts})
+WHERE "code|3" IS NOT NULL
+"""
+
+raw_medstar = con.sql(sql).pl()
+con.close()
+print(f"Raw MedStar rows (all codes): {raw_medstar.shape[0]:,}")
+print(f"Hospitals loaded: {raw_medstar['hosp_name'].n_unique()}")
+```
+
+```{python}
+medstar = standardize_columns(raw_medstar)
+
+medstar = medstar.filter(pl.col("cpt_code").is_in(episode_cpt_set))
+print(f"Filtered to episode codes: {medstar.shape[0]:,} rows")
+print(f"Unique CPT codes found: {medstar['cpt_code'].n_unique()}")
+```
+
+## Coverage Summary
+
+```{python}
+summary = (
+    medstar
+    .group_by("hosp_name")
+    .agg(
+        pl.count().alias("row_count"),
+        pl.col("cpt_code").n_unique().alias("unique_codes"),
+    )
+    .sort("hosp_name")
+)
+print(summary)
+```
+
+```{python}
+by_role = (
+    medstar
+    .join(episode_codes, on="cpt_code", how="left")
+    .group_by("clinical_role")
+    .agg(
+        pl.count().alias("row_count"),
+        pl.col("cpt_code").n_unique().alias("unique_codes"),
+        pl.col("hosp_name").n_unique().alias("hospitals_reporting"),
+    )
+    .sort("clinical_role")
+)
+print(by_role)
+```
+
+## Load CMS MPFS National Data
+
+The CMS Physician Fee Schedule provides national benchmark rates.
+Download the MPFS national payment file from CMS.gov and place it at
+`data/cms/mpfs_national.csv`.
+
+```{python}
+cms_path = CMS_DIR / "mpfs_national.csv"
+
+if not cms_path.exists():
+    print("=" * 60)
+    print("CMS MPFS file not found at:", cms_path)
+    print()
+    print("To download:")
+    print("1. Visit https://www.cms.gov/medicare/payment/fee-schedules/physician/look-up-tool")
+    print("2. Download the national payment file (CSV)")
+    print("3. Save to:", cms_path)
+    print("=" * 60)
+    cms_reference = None
+else:
+    con = get_connection()
+    cms_raw = con.sql(f"""
+        SELECT *
+        FROM read_csv('{cms_path}', all_varchar=true, auto_detect=true)
+    """).pl()
+    con.close()
+    print(f"CMS MPFS raw rows: {cms_raw.shape[0]:,}")
+    print(f"Columns: {cms_raw.columns}")
+```
+
+```{python}
+if cms_path.exists():
+    hcpcs_col = [c for c in cms_raw.columns if "hcpcs" in c.lower() or "cpt" in c.lower()][0]
+
+    cms_reference = (
+        cms_raw
+        .rename({hcpcs_col: "cpt_code"})
+        .filter(pl.col("cpt_code").is_in(episode_cpt_set))
+    )
+    print(f"CMS rows matching episode codes: {cms_reference.shape[0]:,}")
+```
+
+## Write Parquet Outputs
+
+```{python}
+medstar.write_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+print(f"Wrote medstar_charges.parquet: {medstar.shape[0]:,} rows")
+
+if cms_reference is not None:
+    cms_reference.write_parquet(INTERMEDIATE_DIR / "cms_reference.parquet")
+    print(f"Wrote cms_reference.parquet: {cms_reference.shape[0]:,} rows")
+else:
+    print("Skipped cms_reference.parquet (CMS file not available)")
+```
