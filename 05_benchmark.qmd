@@ -1,0 +1,221 @@
+---
+title: "05 — National Benchmarking"
+description: |
+  Compares MedStar per-code charges and episode costs against CMS MPFS
+  national rates. Computes charge-to-allowed ratios and visualizes where
+  MedStar sits relative to national benchmarks.
+dependencies:
+  - data/intermediate/medstar_charges.parquet
+  - data/intermediate/cms_reference.parquet
+  - data/intermediate/episode_costs.parquet
+format: html
+jupyter: python3
+---
+
+## Load Data
+
+```{python}
+import polars as pl
+import matplotlib.pyplot as plt
+import numpy as np
+from _common import INTERMEDIATE_DIR, CHARGE_COLS, EPISODE_FREQUENCIES
+
+medstar = pl.read_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+episode_costs = pl.read_parquet(INTERMEDIATE_DIR / "episode_costs.parquet")
+
+medstar_f = medstar.with_columns([
+    pl.col(c).cast(pl.Float64, strict=False) for c in CHARGE_COLS
+])
+
+cms_path = INTERMEDIATE_DIR / "cms_reference.parquet"
+if not cms_path.exists():
+    print("WARNING: cms_reference.parquet not found.")
+    print("Run 01_ingest.qmd with CMS MPFS data to enable benchmarking.")
+    cms = None
+else:
+    cms = pl.read_parquet(cms_path)
+    print(f"CMS reference rows: {cms.shape[0]:,}")
+    print(f"CMS columns: {cms.columns}")
+```
+
+## Identify CMS Price Columns
+
+CMS MPFS files vary in column naming. We detect the facility and
+non-facility price columns dynamically.
+
+```{python}
+if cms is not None:
+    price_candidates = {
+        "facility": ["fac_price", "facility_price", "par_fee_fac", "fee_fac"],
+        "non_facility": ["non_fac_price", "nonfacility_price", "par_fee_nonfac", "fee_nonfac"],
+    }
+
+    cms_cols_lower = {c.lower(): c for c in cms.columns}
+    fac_col = None
+    nonfac_col = None
+
+    for candidate in price_candidates["facility"]:
+        if candidate in cms_cols_lower:
+            fac_col = cms_cols_lower[candidate]
+            break
+    for candidate in price_candidates["non_facility"]:
+        if candidate in cms_cols_lower:
+            nonfac_col = cms_cols_lower[candidate]
+            break
+
+    if fac_col:
+        print(f"CMS facility price column: {fac_col}")
+    if nonfac_col:
+        print(f"CMS non-facility price column: {nonfac_col}")
+    if not fac_col and not nonfac_col:
+        print("WARNING: Could not identify CMS price columns.")
+        print(f"Available columns: {cms.columns}")
+```
+
+## Per-Code Comparison: MedStar vs. CMS
+
+```{python}
+if cms is not None and fac_col is not None:
+    medstar_medians = (
+        medstar_f
+        .group_by("cpt_code")
+        .agg(pl.col("charge_gross").median().alias("medstar_median_gross"))
+    )
+
+    cms_prices = (
+        cms
+        .select(["cpt_code", fac_col])
+        .rename({fac_col: "cms_fac_price"})
+        .with_columns(pl.col("cms_fac_price").cast(pl.Float64, strict=False))
+        .filter(pl.col("cms_fac_price").is_not_null() & (pl.col("cms_fac_price") > 0))
+    )
+
+    comparison = medstar_medians.join(cms_prices, on="cpt_code", how="inner")
+    comparison = comparison.with_columns(
+        (pl.col("medstar_median_gross") / pl.col("cms_fac_price")).round(2).alias("charge_to_allowed_ratio")
+    )
+
+    print(f"Codes with both MedStar and CMS data: {comparison.shape[0]}")
+    print(comparison.sort("charge_to_allowed_ratio", descending=True))
+else:
+    print("Skipping per-code comparison (CMS data not available)")
+    comparison = None
+```
+
+## Charge-to-Allowed Ratios by Hospital
+
+```{python}
+if cms is not None and fac_col is not None:
+    hosp_ratios = []
+    for hosp in medstar_f["hosp_name"].unique().sort().to_list():
+        hosp_data = medstar_f.filter(pl.col("hosp_name") == hosp)
+        hosp_medians = (
+            hosp_data
+            .group_by("cpt_code")
+            .agg(pl.col("charge_gross").median().alias("medstar_gross"))
+        )
+        merged = hosp_medians.join(cms_prices, on="cpt_code", how="inner")
+        if merged.shape[0] > 0:
+            ratios = (merged["medstar_gross"] / merged["cms_fac_price"]).drop_nulls()
+            hosp_ratios.append({
+                "hosp_name": hosp,
+                "median_ratio": round(ratios.median(), 2) if len(ratios) > 0 else None,
+                "mean_ratio": round(ratios.mean(), 2) if len(ratios) > 0 else None,
+                "n_codes": merged.shape[0],
+            })
+
+    ratio_df = pl.DataFrame(hosp_ratios)
+    print(ratio_df.sort("median_ratio", descending=True))
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    hospitals = ratio_df["hosp_name"].to_list()
+    ratios = ratio_df["median_ratio"].to_list()
+    colors = ["#d32f2f" if r and r > 3 else "#1976d2" for r in ratios]
+    ax.barh(hospitals, ratios, color=colors)
+    ax.axvline(x=1.0, color="black", linestyle="--", linewidth=0.8, label="CMS parity")
+    ax.set_xlabel("Median Charge-to-Allowed Ratio")
+    ax.set_title("MedStar Hospitals: Charge-to-CMS Ratios")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Skipping hospital ratio analysis (CMS data not available)")
+```
+
+## Episode-Level Comparison
+
+```{python}
+if cms is not None and fac_col is not None:
+    cms_episode_total = 0.0
+    cms_components = []
+    for key, spec in EPISODE_FREQUENCIES.items():
+        code = str(spec["code"])
+        qty = spec["qty"]
+        cms_row = cms_prices.filter(pl.col("cpt_code") == code)
+        price = cms_row["cms_fac_price"][0] if cms_row.shape[0] > 0 else None
+        cost = (price or 0) * qty
+        cms_episode_total += cost
+        cms_components.append({"key": key, "cpt_code": code, "cms_price": price, "qty": qty, "line_total": round(cost, 2)})
+
+    print(f"CMS episode total (facility): ${cms_episode_total:,.2f}")
+    print()
+    cms_comp_df = pl.DataFrame(cms_components)
+    print(cms_comp_df)
+
+    print()
+    print("MedStar episode totals for comparison:")
+    for row in episode_costs.sort("episode_total").iter_rows(named=True):
+        pct = ((row["episode_total"] / cms_episode_total) - 1) * 100 if cms_episode_total > 0 else None
+        pct_str = f"{pct:+.1f}%" if pct is not None else "N/A"
+        print(f"  {row['hosp_name']}: ${row['episode_total']:,.2f} ({pct_str} vs CMS)")
+else:
+    print("Skipping episode comparison (CMS data not available)")
+```
+
+## Visualization: MedStar Distribution vs. CMS Benchmark
+
+```{python}
+if cms is not None and fac_col is not None and cms_episode_total > 0:
+    totals = episode_costs["episode_total"].to_list()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.barh(
+        episode_costs["hosp_name"].to_list(),
+        totals,
+        color="#1976d2",
+        label="MedStar",
+    )
+    ax.axvline(x=cms_episode_total, color="#d32f2f", linewidth=2, linestyle="--", label=f"CMS National (${cms_episode_total:,.0f})")
+    ax.set_xlabel("Episode Total ($)")
+    ax.set_title("Liver Biopsy Episode Cost: MedStar Hospitals vs. CMS National")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+else:
+    print("Skipping visualization (CMS data not available)")
+```
+
+## Summary & Limitations
+
+```{python}
+print("=" * 60)
+print("FINDINGS SUMMARY")
+print("=" * 60)
+print()
+
+totals = episode_costs["episode_total"].to_list()
+print(f"MedStar episode cost range: ${min(totals):,.2f} – ${max(totals):,.2f}")
+print(f"MedStar median episode cost: ${sorted(totals)[len(totals)//2]:,.2f}")
+
+if cms is not None and fac_col is not None and cms_episode_total > 0:
+    print(f"CMS national episode cost:   ${cms_episode_total:,.2f}")
+    median_total = sorted(totals)[len(totals) // 2]
+    print(f"MedStar median vs CMS:       {((median_total / cms_episode_total) - 1) * 100:+.1f}%")
+
+print()
+print("LIMITATIONS:")
+print("  - MedStar charges are list prices, not negotiated rates")
+print("  - CMS MPFS reflects Medicare allowed amounts, not commercial rates")
+print("  - Episode frequencies are assumed (adjustable in _common.py)")
+print("  - Some episode codes may not be reported by all hospitals")
+print("  - Reliability filtering excludes high-variance codes from the primary estimate")
+```
