@@ -1,6 +1,16 @@
 data/intermediate/*.parquet
 data/cms/
+_output/
 *.html
 *_files/
 .quarto/
 __pycache__/
+
+/.quarto/
+**/*.quarto_ipynb
+_output
+
+.claude
+.pytest_cache
+.venv
+
