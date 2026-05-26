@@ -2,8 +2,8 @@ import polars as pl
 import _common as C
 
 
-def test_medstar_hospitals_has_10_entries():
-    assert len(C.MEDSTAR_HOSPITALS) == 10
+def test_medstar_hospitals_has_9_entries():
+    assert len(C.MEDSTAR_HOSPITALS) == 9
 
 
 def test_all_hospital_urls_are_https():
