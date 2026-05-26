@@ -1,0 +1,6 @@
+data/intermediate/*.parquet
+data/cms/
+*.html
+*_files/
+.quarto/
+__pycache__/
