@@ -15,7 +15,6 @@ MEDSTAR_HOSPITALS: dict[str, str] = {
     "harbor_hosp": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/520491660_medstarharborhospital_standardcharges.csv",
     "montgomery_med": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/520646893_medstarmontgomerymedicalcenter_standardcharges.csv",
     "national_rehab": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/521369749_medstarnationalrehabilitationhospital_standardcharges.csv",
-    "s_maryland": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/460726303_medstarsouthernmarylandhospitalcenter_standardcharges.csv",
     "mary_hosp": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/520619006_medstarstmaryshospital_standardcharges.csv",
     "union_memorial": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/520591685_medstarunionmemorialhospital_standardcharges.csv",
     "washington_hosp_center": "https://www.medstarhealth.org/-/media/project/mho/medstar/billing-and-insurance/2025/521272129_medstarwashingtonhospitalcenter_standardcharges.csv",
