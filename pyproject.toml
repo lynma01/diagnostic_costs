@@ -11,9 +11,21 @@ dependencies = [
     "polars (>=1.26.0,<2.0.0)",
     "duckdb (>=1.2.1,<2.0.0)",
     "duckdb-engine (>=0.15.0,<0.16.0)",
-    "ipykernel (>=6.29.5,<7.0.0)"
+    "ipykernel (>=6.29.5,<7.0.0)",
+    "matplotlib (>=3.9.0,<4.0.0)",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pyarrow>=24.0.0",
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = false
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
