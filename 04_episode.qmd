@@ -1,0 +1,200 @@
+---
+title: "04 — Episode Cost Assembly"
+description: |
+  Assembles the full liver biopsy episode cost per hospital using the
+  reliability-filtered charge data, with breakdown by clinical role and
+  sensitivity analysis across charge types.
+dependencies:
+  - data/intermediate/medstar_charges.parquet
+  - data/intermediate/code_reliability.parquet
+  - data/intermediate/episode_codes.parquet
+format: html
+jupyter: python3
+---
+
+## Load Data
+
+```{python}
+import polars as pl
+import matplotlib.pyplot as plt
+from _common import INTERMEDIATE_DIR, CHARGE_COLS, EPISODE_FREQUENCIES
+
+medstar = pl.read_parquet(INTERMEDIATE_DIR / "medstar_charges.parquet")
+reliability = pl.read_parquet(INTERMEDIATE_DIR / "code_reliability.parquet")
+episode_codes = pl.read_parquet(INTERMEDIATE_DIR / "episode_codes.parquet")
+
+medstar_f = medstar.with_columns([
+    pl.col(c).cast(pl.Float64, strict=False) for c in CHARGE_COLS
+])
+print(f"Charges: {medstar_f.shape[0]:,} rows")
+print(f"Reliable codes: {reliability.filter(pl.col('is_reliable')).shape[0]}")
+```
+
+## Episode Bundle Definition
+
+The episode assumes these services at the specified frequencies.
+Adjust quantities to reflect the typical care pathway.
+
+```{python}
+freq_df = pl.DataFrame([
+    {"key": k, "cpt_code": str(v["code"]), "qty": v["qty"]}
+    for k, v in EPISODE_FREQUENCIES.items()
+])
+print(freq_df)
+```
+
+## Compute Per-Hospital Episode Cost
+
+For each hospital, we take the median charge per code (across billing
+classes/settings), multiply by the episode frequency, and sum. We use the
+recommended charge type from the reliability analysis where available.
+
+```{python}
+reliable_codes = reliability.filter(pl.col("is_reliable"))
+episode_bundle = freq_df.join(
+    reliable_codes.select(["cpt_code", "recommended_charge_type"]),
+    on="cpt_code",
+    how="left",
+).with_columns(
+    pl.col("recommended_charge_type").fill_null("charge_gross")
+)
+print(f"Episode bundle codes: {episode_bundle.shape[0]}")
+print(episode_bundle)
+```
+
+```{python}
+episode_costs = []
+
+for hosp in medstar_f["hosp_name"].unique().sort().to_list():
+    hosp_data = medstar_f.filter(pl.col("hosp_name") == hosp)
+    total = 0.0
+    components = []
+
+    for row in episode_bundle.iter_rows(named=True):
+        code = row["cpt_code"]
+        qty = row["qty"]
+        charge_col = row["recommended_charge_type"]
+
+        code_data = hosp_data.filter(pl.col("cpt_code") == code)
+        if code_data.shape[0] == 0:
+            components.append({"code": code, "key": row["key"], "charge": None, "qty": qty})
+            continue
+
+        median_charge = code_data[charge_col].drop_nulls().median()
+        if median_charge is None:
+            median_charge = code_data["charge_gross"].drop_nulls().median()
+
+        cost = (median_charge or 0) * qty
+        total += cost
+        components.append({"code": code, "key": row["key"], "charge": median_charge, "qty": qty})
+
+    episode_costs.append({
+        "hosp_name": hosp,
+        "episode_total": round(total, 2),
+        **{c["key"]: round(c["charge"] * c["qty"], 2) if c["charge"] else None for c in components},
+    })
+
+episode_df = pl.DataFrame(episode_costs)
+print(episode_df.sort("episode_total", descending=True))
+```
+
+## Episode Cost Breakdown by Clinical Role
+
+```{python}
+role_map = dict(zip(
+    episode_codes["cpt_code"].to_list(),
+    episode_codes["clinical_role"].to_list()
+))
+
+role_costs = []
+for row in episode_bundle.iter_rows(named=True):
+    code = row["cpt_code"]
+    charge_col = row["recommended_charge_type"]
+    code_data = medstar_f.filter(pl.col("cpt_code") == code)
+    median = code_data[charge_col].drop_nulls().median() if code_data.shape[0] > 0 else None
+    role_costs.append({
+        "key": row["key"],
+        "cpt_code": code,
+        "clinical_role": role_map.get(code, "unknown"),
+        "median_charge": median,
+        "qty": row["qty"],
+        "line_total": round(median * row["qty"], 2) if median else None,
+    })
+
+role_df = pl.DataFrame(role_costs).filter(pl.col("line_total").is_not_null())
+print(role_df)
+```
+
+```{python}
+if role_df.shape[0] > 0:
+    by_role = role_df.group_by("clinical_role").agg(pl.col("line_total").sum())
+    labels = by_role["clinical_role"].to_list()
+    values = by_role["line_total"].to_list()
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.barh(labels, values, color="#1976d2")
+    ax.set_xlabel("Cost ($)")
+    ax.set_title("Episode Cost Breakdown by Clinical Role")
+    plt.tight_layout()
+    plt.show()
+```
+
+## Sensitivity Analysis: Gross vs. Discounted Charges
+
+How does the episode cost change when using gross charges vs. discounted
+cash charges across all codes?
+
+```{python}
+sensitivity = []
+
+for charge_type in ["charge_gross", "charge_discounted"]:
+    for hosp in medstar_f["hosp_name"].unique().sort().to_list():
+        hosp_data = medstar_f.filter(pl.col("hosp_name") == hosp)
+        total = 0.0
+        for row in freq_df.iter_rows(named=True):
+            code = row["cpt_code"]
+            code_data = hosp_data.filter(pl.col("cpt_code") == code)
+            median = code_data[charge_type].drop_nulls().median() if code_data.shape[0] > 0 else None
+            total += (median or 0) * row["qty"]
+        sensitivity.append({
+            "hosp_name": hosp,
+            "charge_type": charge_type,
+            "episode_total": round(total, 2),
+        })
+
+sens_df = pl.DataFrame(sensitivity)
+sens_pivot = sens_df.pivot(on="charge_type", index="hosp_name", values="episode_total")
+print(sens_pivot.sort("charge_gross", descending=True))
+```
+
+```{python}
+if sens_df.shape[0] > 0:
+    hospitals = sorted(medstar_f["hosp_name"].unique().to_list())
+    gross_vals = [
+        sens_df.filter((pl.col("hosp_name") == h) & (pl.col("charge_type") == "charge_gross"))["episode_total"][0]
+        for h in hospitals
+    ]
+    disc_vals = [
+        sens_df.filter((pl.col("hosp_name") == h) & (pl.col("charge_type") == "charge_discounted"))["episode_total"][0]
+        for h in hospitals
+    ]
+
+    x = range(len(hospitals))
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar([i - 0.2 for i in x], gross_vals, 0.4, label="Gross", color="#1976d2")
+    ax.bar([i + 0.2 for i in x], disc_vals, 0.4, label="Discounted", color="#388e3c")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(hospitals, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Episode Total ($)")
+    ax.set_title("Episode Cost: Gross vs. Discounted Charges")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+```
+
+## Write Episode Costs
+
+```{python}
+episode_df.write_parquet(INTERMEDIATE_DIR / "episode_costs.parquet")
+print(f"Wrote episode_costs.parquet: {episode_df.shape[0]} rows")
+```
