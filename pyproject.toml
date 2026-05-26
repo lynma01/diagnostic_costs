@@ -13,6 +13,10 @@ dependencies = [
     "duckdb-engine (>=0.15.0,<0.16.0)",
     "ipykernel (>=6.29.5,<7.0.0)",
     "matplotlib (>=3.9.0,<4.0.0)",
+    "pyyaml>=6.0.3",
+    "nbformat>=5.10.4",
+    "nbclient>=0.10.4",
+    "jupyter-client>=8.8.0",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,70 @@
+---
+title: "00 — Environment & Code Definitions"
+description: |
+  Validates the Python environment, defines the full CPT episode bundle for
+  liver biopsy rejection testing, and writes episode_codes.parquet for
+  downstream notebooks.
+dependencies: []
+format: html
+jupyter: python3
+---
+
+## Environment Check
+
+```{python}
+import importlib.metadata
+import shutil
+
+for pkg in ["polars", "duckdb", "matplotlib"]:
+    print(f"{pkg}: {importlib.metadata.version(pkg)}")
+
+quarto_path = shutil.which("quarto")
+assert quarto_path is not None, "Quarto CLI not found on PATH"
+print(f"quarto: {quarto_path}")
+```
+
+## Episode CPT Code Bundle
+
+This project models the **full episode cost** for a liver biopsy testing for
+transplanted organ rejection. The episode includes consult, infusion,
+procedure, and follow-up codes across inpatient and outpatient settings.
+
+The codes below were provided as the episode definition. Some categories
+(neonatal, preventive medicine) may not appear in hospital data for this
+procedure — downstream notebooks will surface those gaps.
+
+```{python}
+from _common import build_episode_codes_df, INTERMEDIATE_DIR, _CODE_GROUPS
+
+episode_codes = build_episode_codes_df()
+print(f"Total episode codes: {episode_codes.shape[0]}")
+print(f"Clinical roles: {episode_codes['clinical_role'].n_unique()}")
+print()
+
+for role in episode_codes["clinical_role"].unique().sort().to_list():
+    subset = episode_codes.filter(episode_codes["clinical_role"] == role)
+    codes = subset["cpt_code"].to_list()
+    setting = subset["setting"][0]
+    print(f"  {role} ({setting}): {', '.join(codes)}")
+```
+
+## Write Episode Codes to Parquet
+
+```{python}
+INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
+out_path = INTERMEDIATE_DIR / "episode_codes.parquet"
+episode_codes.write_parquet(out_path)
+print(f"Wrote {episode_codes.shape[0]} rows to {out_path}")
+```
+
+## DuckDB Smoke Test
+
+```{python}
+from _common import get_connection
+
+con = get_connection()
+result = con.sql("SELECT 42 AS answer").pl()
+assert result["answer"][0] == 42
+print("DuckDB connection OK")
+con.close()
+```
